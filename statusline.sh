@@ -70,6 +70,8 @@ bar+="\033[0m"
 # === Usage limits (cached, refresh every 2 min) ===
 CACHE_FILE="$HOME/.claude/.usage-cache.json"
 CACHE_TTL=120
+WEEK_RECOVERY_CACHE="$HOME/.claude/.week-recovery-cache.txt"
+WEEK_RECOVERY_TTL=300
 
 fetch_usage() {
     local token cred_json
@@ -85,6 +87,10 @@ fetch_usage() {
     else
         # Linux: GNOME Keyring / KWallet via libsecret
         cred_json=$(secret-tool lookup service "Claude Code-credentials" 2>/dev/null)
+        # Fallback: file-based credentials (used when no keyring available)
+        if [ -z "$cred_json" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
+            cred_json=$(cat "$HOME/.claude/.credentials.json")
+        fi
     fi
 
     # Step 2: Extract OAuth access token from JSON
@@ -108,7 +114,11 @@ get_usage() {
     cache_time=0
 
     if [ -f "$CACHE_FILE" ]; then
-        cache_time=$(stat -f %m "$CACHE_FILE" 2>/dev/null || stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            cache_time=$(stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)
+        else
+            cache_time=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+        fi
     fi
 
     if [ $((now - cache_time)) -gt $CACHE_TTL ]; then
@@ -133,6 +143,102 @@ usage_color() {
         echo "\033[33m"
     else
         echo "\033[31m"
+    fi
+}
+
+get_week_recovery() {
+    # Returns "+5%:Xh +10%:Yh" based on rolling 7-day window analysis
+    # Uses JSONL files to estimate when old usage rolls off the window
+    local week_used="$1"
+    local now cache_time
+    now=$(date +%s)
+    cache_time=0
+
+    if [ -f "$WEEK_RECOVERY_CACHE" ]; then
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            cache_time=$(stat -f %m "$WEEK_RECOVERY_CACHE" 2>/dev/null || echo 0)
+        else
+            cache_time=$(stat -c %Y "$WEEK_RECOVERY_CACHE" 2>/dev/null || echo 0)
+        fi
+    fi
+
+    if [ $((now - cache_time)) -gt $WEEK_RECOVERY_TTL ]; then
+        local result
+        result=$(python3 -c "
+import json, glob, os, sys
+from datetime import datetime, timezone, timedelta
+
+week_used = float(sys.argv[1])
+if week_used <= 0:
+    sys.exit(0)
+
+projects_dir = os.path.expanduser('~/.claude/projects')
+day_tokens = {}
+now = datetime.now(timezone.utc)
+
+for fpath in glob.glob(os.path.join(projects_dir, '**/*.jsonl'), recursive=True):
+    try:
+        with open(fpath) as f:
+            for line in f:
+                try:
+                    r = json.loads(line.strip())
+                    ts = r.get('timestamp', '')
+                    msg = r.get('message', {})
+                    usage = msg.get('usage') if isinstance(msg, dict) else None
+                    if not usage or not ts:
+                        continue
+                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    age_h = (now - dt).total_seconds() / 3600
+                    if age_h > 168:
+                        continue
+                    day = dt.strftime('%Y-%m-%d')
+                    day_tokens[day] = day_tokens.get(day, 0) + sum(
+                        (usage.get(k) or 0) for k in
+                        ['input_tokens', 'output_tokens',
+                         'cache_creation_input_tokens', 'cache_read_input_tokens'])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+weekly_total = sum(day_tokens.values())
+if weekly_total == 0:
+    sys.exit(0)
+
+# Rolling window: day N days ago rolls off between (6-N)*24 and (7-N)*24 hours from now.
+# Midpoint estimate: (6-N)*24 + 12 hours.
+# days_ago=6 -> 12h, days_ago=5 -> 36h, days_ago=4 -> 60h, etc.
+targets = {5: None, 10: None}
+cumulative = 0.0
+
+for days_ago in range(6, -1, -1):
+    day = (now - timedelta(days=days_ago)).strftime('%Y-%m-%d')
+    day_pct = (day_tokens.get(day, 0) / weekly_total) * week_used
+    midpoint_h = (6 - days_ago) * 24 + 12
+    cumulative += day_pct
+    for t in [5, 10]:
+        if targets[t] is None and cumulative >= t:
+            targets[t] = midpoint_h
+
+parts = []
+for t in [5, 10]:
+    h = targets[t]
+    if h is not None:
+        if h < 2:
+            parts.append(f'↑{t}%:now')
+        elif h < 24:
+            parts.append(f'↑{t}%:{int(h)}h')
+        else:
+            d, hh = int(h) // 24, int(h) % 24
+            parts.append(f'↑{t}%:{d}d{hh}h' if hh else f'↑{t}%:{d}d')
+print(' '.join(parts))
+" "$week_used" 2>/dev/null)
+        umask 077
+        echo "$result" > "$WEEK_RECOVERY_CACHE"
+    fi
+
+    if [ -f "$WEEK_RECOVERY_CACHE" ]; then
+        cat "$WEEK_RECOVERY_CACHE"
     fi
 }
 
@@ -168,13 +274,18 @@ except Exception:
 " "$five_h_reset" 2>/dev/null)
     fi
 
+    week_recovery=$(get_week_recovery "$week_used")
+
     five_color=$(usage_color "$five_h_left")
     week_color=$(usage_color "$week_left")
 
+    week_part="${week_color}W:${week_left}%\033[0m"
+    [ -n "$week_recovery" ] && week_part+=" \033[36m${week_recovery}\033[0m"
+
     if [ -n "$time_left" ]; then
-        limits_part="${five_color}H:${five_h_left}% ${time_left}\033[0m ${week_color}W:${week_left}%\033[0m"
+        limits_part="${five_color}H:${five_h_left}% ${time_left}\033[0m ${week_part}"
     else
-        limits_part="${five_color}H:${five_h_left}%\033[0m ${week_color}W:${week_left}%\033[0m"
+        limits_part="${five_color}H:${five_h_left}%\033[0m ${week_part}"
     fi
 fi
 

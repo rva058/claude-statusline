@@ -31,7 +31,7 @@
 | Модель | `[Opus 4.6]` | Текущая модель |
 | Контекст | `━━━━━━ 25% (50K/200K)` | Прогресс-бар использования контекста с цветовой индикацией |
 | 5-часовой лимит | `H:78% 1h34m` | Остаток квоты за скользящие 5 часов + время до сброса |
-| Недельный лимит | `W:87%` | Остаток квоты за скользящие 7 дней |
+| Недельный лимит | `W:51% ↑5%:1d12h ↑10%:2d12h` | Остаток квоты за 7 дней + прогноз восстановления +5% и +10% |
 | Проект | `my-app` | Имя текущей директории |
 | Git-ветка | `git:(main)` | Активная ветка (скрыта вне git-репозиториев) |
 | MCP-серверы | `3 MCPs` | Количество подключённых MCP-серверов (скрыто при 0) |
@@ -99,9 +99,21 @@ Claude Code запускает скрипт после каждого сообщ
 | Лимит | Расшифровка |
 |-------|-------------|
 | **H** (hourly) | Квота за скользящее 5-часовое окно. Сбрасывается постепенно. |
-| **W** (weekly) | Квота за скользящее 7-дневное окно. Сбрасывается постепенно. |
+| **W** (weekly) | Квота за скользящее 7-дневное окно + прогноз `↑5%` и `↑10%`. |
 
 Процент — это **остаток** (100% = полная ёмкость, 0% = лимит достигнут). Время после `H:` — когда окно полностью обновится.
+
+### Прогноз восстановления недельного лимита
+
+```
+W:51% ↑5%:1d12h ↑10%:2d12h
+```
+
+`↑5%:1d12h` означает: примерно через 1 день 12 часов из скользящего 7-дневного окна выпадут токены, потраченные неделю назад, и лимит вырастет на 5%.
+
+Как это работает: скрипт читает локальные JSONL-файлы (`~/.claude/projects/**/*.jsonl`) и анализирует дневной расход токенов за последние 7 дней. Поскольку окно скользящее, токены расходованные *N* дней назад выпадут из учёта примерно через *(7 − N)* дней. Зная дневную разбивку, скрипт предсказывает когда накопится +5% и +10% свободной квоты.
+
+Результат кешируется на 5 минут в `~/.claude/.week-recovery-cache.txt`. Прогноз не отображается если недельное использование равно 0%.
 
 ### Как скрипт получает данные
 
@@ -156,7 +168,7 @@ curl -sf "https://api.anthropic.com/api/oauth/usage" \
 
 **Шаг 3** — Расчёт: `remaining = 100 - utilization`, вычисление оставшегося времени, выбор цвета.
 
-**Кэширование** — API вызывается не чаще раза в 2 минуты. Кэш: `~/.claude/.usage-cache.json` (права 600).
+**Кэширование** — API вызывается не чаще раза в 2 минуты. Кэш: `~/.claude/.usage-cache.json` (права 600). Прогноз восстановления кешируется на 5 минут: `~/.claude/.week-recovery-cache.txt`.
 
 ---
 
@@ -275,12 +287,14 @@ cred_json=$(/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoPro
 | `H:` и `W:` не отображаются | Токен не найден — проверьте инструкции для вашей платформы |
 | Показывает `H:?% W:?%` | API вернул ошибку — токен мог истечь, выполните `claude login` |
 | Числа не обновляются | Кэш (2 мин) — подождите или удалите `~/.claude/.usage-cache.json` |
+| `↑5%`/`↑10%` не обновляются | Кэш прогноза (5 мин) — удалите `~/.claude/.week-recovery-cache.txt` |
+| `↑5%`/`↑10%` не отображаются | Недельное использование = 0%, или нет JSONL-данных за 7 дней |
 | Скрипт не запускается | Проверьте `jq`: `echo '{}' \| jq .` — если ошибка, установите jq |
 
 Принудительное обновление:
 
 ```bash
-rm ~/.claude/.usage-cache.json
+rm ~/.claude/.usage-cache.json ~/.claude/.week-recovery-cache.txt
 # Следующее сообщение в Claude Code вызовет свежий запрос к API
 ```
 
@@ -331,7 +345,7 @@ bar_len=10  # по умолчанию 6
 ## Удаление
 
 ```bash
-rm ~/.claude/statusline.sh ~/.claude/.usage-cache.json
+rm ~/.claude/statusline.sh ~/.claude/.usage-cache.json ~/.claude/.week-recovery-cache.txt
 # Удалите ключ "statusLine" из ~/.claude/settings.json
 ```
 
@@ -367,7 +381,7 @@ rm ~/.claude/statusline.sh ~/.claude/.usage-cache.json
 | Model | `[Opus 4.6]` | Current model name |
 | Context bar | `━━━━━━ 25% (50K/200K)` | Visual progress bar with token count. Green → yellow → red |
 | Hourly limit | `H:78% 1h34m` | Remaining 5-hour usage quota + time until reset |
-| Weekly limit | `W:87%` | Remaining 7-day usage quota |
+| Weekly limit | `W:51% ↑5%:1d12h ↑10%:2d12h` | Remaining 7-day quota + predicted recovery time for +5% and +10% |
 | Project | `my-app` | Current directory name |
 | Git branch | `git:(main)` | Active branch (hidden outside git repos) |
 | MCP servers | `3 MCPs` | Connected MCP server count (hidden if 0) |
@@ -418,9 +432,21 @@ The `H:78% 1h34m` and `W:87%` segments show remaining Claude Code rate limit quo
 | Limit | Meaning |
 |-------|---------|
 | **H** (hourly) | Rolling 5-hour window quota |
-| **W** (weekly) | Rolling 7-day window quota |
+| **W** (weekly) | Rolling 7-day window quota + `↑5%` / `↑10%` recovery forecast |
 
 Percentage shows **remaining** capacity (100% = full, 0% = limit reached). Time after `H:` shows when the 5-hour window fully resets.
+
+### Weekly limit recovery forecast
+
+```
+W:51% ↑5%:1d12h ↑10%:2d12h
+```
+
+`↑5%:1d12h` means: in approximately 1 day 12 hours, enough old token usage will roll off the 7-day window to free up 5% of capacity.
+
+The script reads local JSONL session files (`~/.claude/projects/**/*.jsonl`) to get the per-day token breakdown for the past 7 days. Since it's a rolling window, usage from *N* days ago will roll off in *(7 − N)* days. The script finds when the cumulative freed usage reaches +5% and +10%, and shows that as a countdown.
+
+Results are cached for 5 minutes at `~/.claude/.week-recovery-cache.txt`. The forecast is hidden when weekly usage is 0%.
 
 ### How it works under the hood
 
@@ -468,6 +494,8 @@ If nothing prints, run `claude login` to re-authenticate.
 | `H:` and `W:` missing | Token not found — verify with commands above |
 | Shows `H:?% W:?%` | API error — token may be expired, run `claude login` |
 | Numbers seem stuck | Cache is active (2 min) — wait or `rm ~/.claude/.usage-cache.json` |
+| `↑5%`/`↑10%` not updating | Recovery cache (5 min) — `rm ~/.claude/.week-recovery-cache.txt` |
+| `↑5%`/`↑10%` not shown | Weekly usage is 0%, or no JSONL data for past 7 days |
 
 ## Customization
 
@@ -482,7 +510,7 @@ Edit `~/.claude/statusline.sh` directly, or use inside Claude Code:
 ## Uninstall
 
 ```bash
-rm ~/.claude/statusline.sh ~/.claude/.usage-cache.json
+rm ~/.claude/statusline.sh ~/.claude/.usage-cache.json ~/.claude/.week-recovery-cache.txt
 ```
 
 Remove the `statusLine` key from `~/.claude/settings.json`.
