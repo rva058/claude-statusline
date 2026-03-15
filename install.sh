@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-STATUSLINE_URL="https://raw.githubusercontent.com/AndyShaman/claude-statusline/main/statusline.sh"
+STATUSLINE_URL="https://raw.githubusercontent.com/rva058/claude-statusline/main/statusline.sh"
 DEST="$HOME/.claude/statusline.sh"
 SETTINGS="$HOME/.claude/settings.json"
 
